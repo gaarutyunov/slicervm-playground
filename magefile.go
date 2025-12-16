@@ -383,3 +383,4 @@ func (Rustfs) YAML() error {
 	fmt.Println(rustfs.GenerateYAML(config, githubUser))
 	return nil
 }
+
