@@ -14,8 +14,8 @@ var userdataScript string
 
 const (
 	DefaultHostGroup   = "api"
-	DefaultVCPU        = 4
-	DefaultRAMGB       = 8
+	DefaultVCPU        = 2
+	DefaultRAMGB       = 4
 	DefaultStorageSize = "25G"
 )
 
