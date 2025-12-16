@@ -1,0 +1,4 @@
+github.com/magefile/mage v1.15.0 h1:BvGheCMAsG3bWUDbZ8AyXXpCNwU9u5CB6sM+HNb9HYg=
+github.com/magefile/mage v1.15.0/go.mod h1:z5UZb/iS3GoOSn0JgWuiw7dxlurVYTu+/jHXqQg881A=
+github.com/slicervm/sdk v0.0.12 h1:LvVyFZNHUIgBRrtCDH/Udi+mJHhoMhgww08w4G6ljLI=
+github.com/slicervm/sdk v0.0.12/go.mod h1:loZZauzbYFQ9hQI1iPkKh7FlHs8lU63y3I8fvUQ2dvc=
