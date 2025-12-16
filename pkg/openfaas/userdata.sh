@@ -14,8 +14,9 @@ set -euxo pipefail
 #==============================================================================
 
 # Install additional services (registry and function builder)
+# Note: Builder requires OpenFaaS Enterprise license, disabled by default
 export INSTALL_REGISTRY=true
-export INSTALL_BUILDER=true
+export INSTALL_BUILDER=false
 
 #==============================================================================
 # SYSTEM PREPARATION and OpenFaaS Edge Installation
