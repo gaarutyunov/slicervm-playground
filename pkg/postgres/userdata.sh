@@ -22,8 +22,14 @@ PG_HBA="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
 # Configure PostgreSQL to listen on all interfaces
 sudo sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" "$PG_CONF"
 
-# Allow remote connections with password authentication
-echo "host    all             all             0.0.0.0/0               scram-sha-256" | sudo tee -a "$PG_HBA"
+# Enable secure password encryption (recommended by Gitea docs)
+sudo sed -i "s/#password_encryption = scram-sha-256/password_encryption = scram-sha-256/" "$PG_CONF"
+
+# Configure access settings (following Gitea recommendations)
+# Allow local connections for the specific user/database
+echo "local   ${POSTGRES_DB}    ${POSTGRES_USER}    scram-sha-256" | sudo tee -a "$PG_HBA"
+# Allow remote connections for the specific user/database
+echo "host    ${POSTGRES_DB}    ${POSTGRES_USER}    0.0.0.0/0    scram-sha-256" | sudo tee -a "$PG_HBA"
 
 # Start PostgreSQL (may not auto-start during install)
 sudo systemctl start postgresql
@@ -32,10 +38,12 @@ sudo systemctl enable postgresql
 # Wait for PostgreSQL to be ready
 sleep 3
 
-# Create database and user
+# Create database and user following Gitea recommendations:
+# - Use CREATE ROLE with LOGIN
+# - Create database with proper encoding (template0, UTF8, en_US.UTF-8)
 sudo -u postgres psql <<EOF
-CREATE USER ${POSTGRES_USER} WITH PASSWORD '${POSTGRES_PASSWORD}';
-CREATE DATABASE ${POSTGRES_DB} OWNER ${POSTGRES_USER};
+CREATE ROLE ${POSTGRES_USER} WITH LOGIN PASSWORD '${POSTGRES_PASSWORD}';
+CREATE DATABASE ${POSTGRES_DB} WITH OWNER ${POSTGRES_USER} TEMPLATE template0 ENCODING UTF8 LC_COLLATE 'en_US.UTF-8' LC_CTYPE 'en_US.UTF-8';
 GRANT ALL PRIVILEGES ON DATABASE ${POSTGRES_DB} TO ${POSTGRES_USER};
 EOF
 

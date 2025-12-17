@@ -13,9 +13,11 @@ import (
 
 	"github.com/gaarutyunov/slicer/pkg/buildkit"
 	"github.com/gaarutyunov/slicer/pkg/crossplane"
+	"github.com/gaarutyunov/slicer/pkg/gitea"
 	"github.com/gaarutyunov/slicer/pkg/k3s"
 	"github.com/gaarutyunov/slicer/pkg/openfaas"
 	"github.com/gaarutyunov/slicer/pkg/postgres"
+	"github.com/gaarutyunov/slicer/pkg/runner"
 	"github.com/gaarutyunov/slicer/pkg/rustfs"
 	"github.com/magefile/mage/mg"
 )
@@ -510,6 +512,398 @@ func (Postgres) YAML() error {
 
 	config := postgres.DefaultConfig()
 	fmt.Println(postgres.GenerateYAML(config, githubUser))
+	return nil
+}
+
+// Gitea targets
+type Gitea mg.Namespace
+
+// Deploy creates a new Gitea VM with snap installation
+// Required env vars: GITEA_DB_PASS, GITEA_S3_ACCESS_KEY, GITEA_S3_SECRET_KEY
+// Optional env vars: GITEA_DB_HOST (auto-detected from postgres VM), GITEA_S3_ENDPOINT (auto-detected from rustfs VM)
+func (Gitea) Deploy(ctx context.Context) error {
+	config := gitea.DefaultConfig()
+
+	if gh := os.Getenv("GITHUB_USER"); gh != "" {
+		config.GitHubUser = gh
+	}
+
+	if key := loadSSHKey(); key != "" {
+		config.SSHKeys = append(config.SSHKeys, key)
+	}
+
+	// Database host - auto-detect from postgres VM if not specified
+	dbHost := os.Getenv("GITEA_DB_HOST")
+	if dbHost == "" {
+		// Try to find a running postgres VM
+		pgConfig := postgres.DefaultConfig()
+		pgDeployer, err := postgres.NewDeployerFromEnv(pgConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create postgres deployer: %w", err)
+		}
+		nodes, err := pgDeployer.List(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list postgres nodes: %w", err)
+		}
+		// Find first postgres VM
+		for _, node := range nodes {
+			if hasTag(node.Tags, "postgres") {
+				dbHost = node.IP
+				// Strip CIDR suffix
+				if idx := strings.Index(dbHost, "/"); idx != -1 {
+					dbHost = dbHost[:idx]
+				}
+				fmt.Printf("Auto-detected PostgreSQL host: %s\n", dbHost)
+				break
+			}
+		}
+		if dbHost == "" {
+			return fmt.Errorf("no postgres VM found; deploy one with 'mage postgres:deploy' or set GITEA_DB_HOST")
+		}
+	}
+	config.DBHost = dbHost
+
+	dbPass := os.Getenv("GITEA_DB_PASS")
+	if dbPass == "" {
+		return fmt.Errorf("GITEA_DB_PASS environment variable is required")
+	}
+	config.DBPass = dbPass
+
+	// Optional database config
+	if port := os.Getenv("GITEA_DB_PORT"); port != "" {
+		fmt.Sscanf(port, "%d", &config.DBPort)
+	}
+	if name := os.Getenv("GITEA_DB_NAME"); name != "" {
+		config.DBName = name
+	}
+	if user := os.Getenv("GITEA_DB_USER"); user != "" {
+		config.DBUser = user
+	}
+
+	// S3 Storage - auto-detect from rustfs VM if not specified
+	s3Endpoint := os.Getenv("GITEA_S3_ENDPOINT")
+	if s3Endpoint == "" {
+		// Try to find a running rustfs VM
+		rustfsConfig := rustfs.DefaultConfig()
+		rustfsDeployer, err := rustfs.NewDeployerFromEnv(rustfsConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create rustfs deployer: %w", err)
+		}
+		nodes, err := rustfsDeployer.List(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list rustfs nodes: %w", err)
+		}
+		// Find first rustfs VM
+		for _, node := range nodes {
+			if hasTag(node.Tags, "rustfs") {
+				s3Host := node.IP
+				// Strip CIDR suffix
+				if idx := strings.Index(s3Host, "/"); idx != -1 {
+					s3Host = s3Host[:idx]
+				}
+				s3Endpoint = fmt.Sprintf("%s:9000", s3Host)
+				fmt.Printf("Auto-detected RustFS endpoint: %s\n", s3Endpoint)
+				break
+			}
+		}
+		if s3Endpoint == "" {
+			return fmt.Errorf("no rustfs VM found; deploy one with 'mage rustfs:deploy' or set GITEA_S3_ENDPOINT")
+		}
+	}
+	config.S3Endpoint = s3Endpoint
+
+	s3AccessKey := os.Getenv("GITEA_S3_ACCESS_KEY")
+	if s3AccessKey == "" {
+		return fmt.Errorf("GITEA_S3_ACCESS_KEY environment variable is required")
+	}
+	config.S3AccessKey = s3AccessKey
+
+	s3SecretKey := os.Getenv("GITEA_S3_SECRET_KEY")
+	if s3SecretKey == "" {
+		return fmt.Errorf("GITEA_S3_SECRET_KEY environment variable is required")
+	}
+	config.S3SecretKey = s3SecretKey
+
+	// Optional S3 config
+	if bucket := os.Getenv("GITEA_S3_BUCKET"); bucket != "" {
+		config.S3Bucket = bucket
+	}
+	if ssl := os.Getenv("GITEA_S3_USE_SSL"); ssl == "true" {
+		config.S3UseSSL = true
+	}
+
+	deployer, err := gitea.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	resp, err := deployer.Deploy(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to deploy gitea: %w", err)
+	}
+
+	// Strip CIDR suffix from IP
+	ip := resp.IP
+	if idx := strings.Index(ip, "/"); idx != -1 {
+		ip = ip[:idx]
+	}
+
+	fmt.Printf("Gitea VM deployed:\n")
+	fmt.Printf("  Hostname: %s\n", resp.Hostname)
+	fmt.Printf("  IP: %s\n", ip)
+	fmt.Printf("  Created: %s\n", resp.CreatedAt)
+	fmt.Printf("\nDatabase configured:\n")
+	fmt.Printf("  Host: %s\n", config.DBHost)
+	fmt.Printf("  Database: %s\n", config.DBName)
+	fmt.Printf("  User: %s\n", config.DBUser)
+	fmt.Printf("\nS3 Storage configured:\n")
+	fmt.Printf("  Endpoint: %s\n", config.S3Endpoint)
+	fmt.Printf("  Bucket: %s\n", config.S3Bucket)
+	fmt.Printf("\nNext steps:\n")
+	fmt.Printf("  1. SSH: ssh ubuntu@%s\n", ip)
+	fmt.Printf("  2. Web UI: http://%s:3000\n", ip)
+	fmt.Printf("  3. Complete setup wizard in browser\n")
+	fmt.Printf("  4. Configure S3 storage in app.ini (see /home/ubuntu/gitea-info.txt)\n")
+
+	return nil
+}
+
+// List shows all Gitea VMs (filtered by "gitea" tag)
+func (Gitea) List(ctx context.Context) error {
+	config := gitea.DefaultConfig()
+
+	deployer, err := gitea.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	nodes, err := deployer.List(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list gitea nodes: %w", err)
+	}
+
+	printNodeList(nodes, "gitea", "Gitea")
+	return nil
+}
+
+// Delete removes a Gitea VM by hostname
+func (Gitea) Delete(ctx context.Context, hostname string) error {
+	config := gitea.DefaultConfig()
+
+	deployer, err := gitea.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	if err := deployer.Delete(ctx, hostname); err != nil {
+		return fmt.Errorf("failed to delete gitea VM %s: %w", hostname, err)
+	}
+
+	fmt.Printf("Gitea VM %s deleted\n", hostname)
+	return nil
+}
+
+// Logs shows serial console logs for a Gitea VM
+func (Gitea) Logs(ctx context.Context, hostname string) error {
+	config := gitea.DefaultConfig()
+
+	deployer, err := gitea.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	logs, err := deployer.Logs(ctx, hostname, 50)
+	if err != nil {
+		return fmt.Errorf("failed to get logs for %s: %w", hostname, err)
+	}
+
+	fmt.Println(logs)
+	return nil
+}
+
+// Userdata prints the Gitea userdata script
+func (Gitea) Userdata() {
+	fmt.Println(gitea.Userdata())
+}
+
+// YAML generates a Slicer config YAML for Gitea
+func (Gitea) YAML() error {
+	githubUser := os.Getenv("GITHUB_USER")
+	if githubUser == "" {
+		return fmt.Errorf("GITHUB_USER environment variable is required")
+	}
+
+	config := gitea.DefaultConfig()
+	fmt.Println(gitea.GenerateYAML(config, githubUser))
+	return nil
+}
+
+// Runner targets for Gitea Actions Runner
+type Runner mg.Namespace
+
+// Deploy creates a new Gitea Runner VM
+// Required env vars: RUNNER_TOKEN (from Gitea admin/actions/runners)
+// Optional env vars: GITEA_URL (auto-detected from gitea VM), RUNNER_NAME, RUNNER_LABELS, RUNNER_VERSION
+func (Runner) Deploy(ctx context.Context) error {
+	config := runner.DefaultConfig()
+
+	if gh := os.Getenv("GITHUB_USER"); gh != "" {
+		config.GitHubUser = gh
+	}
+
+	if key := loadSSHKey(); key != "" {
+		config.SSHKeys = append(config.SSHKeys, key)
+	}
+
+	// Gitea URL - auto-detect from gitea VM if not specified
+	giteaURL := os.Getenv("GITEA_URL")
+	if giteaURL == "" {
+		// Try to find a running gitea VM
+		giteaConfig := gitea.DefaultConfig()
+		giteaDeployer, err := gitea.NewDeployerFromEnv(giteaConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create gitea deployer: %w", err)
+		}
+		nodes, err := giteaDeployer.List(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list gitea nodes: %w", err)
+		}
+		// Find first gitea VM
+		for _, node := range nodes {
+			if hasTag(node.Tags, "gitea") {
+				giteaHost := node.IP
+				// Strip CIDR suffix
+				if idx := strings.Index(giteaHost, "/"); idx != -1 {
+					giteaHost = giteaHost[:idx]
+				}
+				giteaURL = fmt.Sprintf("http://%s:3000", giteaHost)
+				fmt.Printf("Auto-detected Gitea URL: %s\n", giteaURL)
+				break
+			}
+		}
+		if giteaURL == "" {
+			return fmt.Errorf("no gitea VM found; deploy one with 'mage gitea:deploy' or set GITEA_URL")
+		}
+	}
+	config.GiteaURL = giteaURL
+
+	// Runner token is required
+	runnerToken := os.Getenv("RUNNER_TOKEN")
+	if runnerToken == "" {
+		return fmt.Errorf("RUNNER_TOKEN environment variable is required (get it from %s/admin/actions/runners)", giteaURL)
+	}
+	config.RunnerToken = runnerToken
+
+	// Optional config
+	if name := os.Getenv("RUNNER_NAME"); name != "" {
+		config.RunnerName = name
+	}
+	if labels := os.Getenv("RUNNER_LABELS"); labels != "" {
+		config.Labels = labels
+	}
+	if version := os.Getenv("RUNNER_VERSION"); version != "" {
+		config.Version = version
+	}
+
+	deployer, err := runner.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	resp, err := deployer.Deploy(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to deploy runner: %w", err)
+	}
+
+	// Strip CIDR suffix from IP
+	ip := resp.IP
+	if idx := strings.Index(ip, "/"); idx != -1 {
+		ip = ip[:idx]
+	}
+
+	fmt.Printf("Gitea Runner VM deployed:\n")
+	fmt.Printf("  Hostname: %s\n", resp.Hostname)
+	fmt.Printf("  IP: %s\n", ip)
+	fmt.Printf("  Created: %s\n", resp.CreatedAt)
+	fmt.Printf("\nRunner configured:\n")
+	fmt.Printf("  Gitea URL: %s\n", config.GiteaURL)
+	fmt.Printf("  Labels: %s\n", config.Labels)
+	fmt.Printf("  Version: %s\n", config.Version)
+	fmt.Printf("\nNext steps:\n")
+	fmt.Printf("  1. SSH: ssh ubuntu@%s\n", ip)
+	fmt.Printf("  2. Check status: sudo systemctl status act_runner\n")
+	fmt.Printf("  3. View logs: sudo journalctl -u act_runner -f\n")
+
+	return nil
+}
+
+// List shows all Runner VMs (filtered by "runner" tag)
+func (Runner) List(ctx context.Context) error {
+	config := runner.DefaultConfig()
+
+	deployer, err := runner.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	nodes, err := deployer.List(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list runner nodes: %w", err)
+	}
+
+	printNodeList(nodes, "runner", "Runner")
+	return nil
+}
+
+// Delete removes a Runner VM by hostname
+func (Runner) Delete(ctx context.Context, hostname string) error {
+	config := runner.DefaultConfig()
+
+	deployer, err := runner.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	if err := deployer.Delete(ctx, hostname); err != nil {
+		return fmt.Errorf("failed to delete runner VM %s: %w", hostname, err)
+	}
+
+	fmt.Printf("Runner VM %s deleted\n", hostname)
+	return nil
+}
+
+// Logs shows serial console logs for a Runner VM
+func (Runner) Logs(ctx context.Context, hostname string) error {
+	config := runner.DefaultConfig()
+
+	deployer, err := runner.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	logs, err := deployer.Logs(ctx, hostname, 50)
+	if err != nil {
+		return fmt.Errorf("failed to get logs for %s: %w", hostname, err)
+	}
+
+	fmt.Println(logs)
+	return nil
+}
+
+// Userdata prints the Runner userdata script
+func (Runner) Userdata() {
+	fmt.Println(runner.Userdata())
+}
+
+// YAML generates a Slicer config YAML for Runner
+func (Runner) YAML() error {
+	githubUser := os.Getenv("GITHUB_USER")
+	if githubUser == "" {
+		return fmt.Errorf("GITHUB_USER environment variable is required")
+	}
+
+	config := runner.DefaultConfig()
+	fmt.Println(runner.GenerateYAML(config, githubUser))
 	return nil
 }
 

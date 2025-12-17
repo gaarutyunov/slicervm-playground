@@ -1,11 +1,9 @@
-package postgres
+package gitea
 
 import (
 	"context"
-	"crypto/rand"
 	_ "embed"
 	"fmt"
-	"math/big"
 	"os"
 	"strings"
 
@@ -20,13 +18,9 @@ const (
 	DefaultVCPU        = 2
 	DefaultRAMGB       = 4
 	DefaultStorageSize = "25G"
-	DefaultPort        = 5432
-	DefaultDBName      = "giteadb"
-	DefaultDBUser      = "gitea"
+	DefaultHTTPPort    = 3000
+	DefaultSSHPort     = 2222
 )
-
-// alphanumeric characters for password generation (no special chars)
-const alphanumeric = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 type Config struct {
 	HostGroup   string
@@ -36,36 +30,18 @@ type Config struct {
 	SSHKeys     []string
 	GitHubUser  string
 	Tags        []string
-	// PostgreSQL specific
+	// Database connection (external PostgreSQL)
+	DBHost string
+	DBPort int
 	DBName string
 	DBUser string
 	DBPass string
-}
-
-// Credentials holds the generated PostgreSQL credentials
-type Credentials struct {
-	DBName string
-	DBUser string
-	DBPass string
-}
-
-// DeployResponse contains VM info and credentials
-type DeployResponse struct {
-	*sdk.SlicerCreateNodeResponse
-	Credentials Credentials
-}
-
-// GeneratePassword creates a cryptographically secure random alphanumeric password
-func GeneratePassword(length int) (string, error) {
-	result := make([]byte, length)
-	for i := 0; i < length; i++ {
-		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphanumeric))))
-		if err != nil {
-			return "", fmt.Errorf("failed to generate random password: %w", err)
-		}
-		result[i] = alphanumeric[num.Int64()]
-	}
-	return string(result), nil
+	// S3 Storage (RustFS/MinIO)
+	S3Endpoint  string
+	S3AccessKey string
+	S3SecretKey string
+	S3Bucket    string
+	S3UseSSL    bool
 }
 
 func DefaultConfig() Config {
@@ -79,9 +55,12 @@ func DefaultConfig() Config {
 		VCPU:        DefaultVCPU,
 		RAMGB:       DefaultRAMGB,
 		StorageSize: DefaultStorageSize,
-		Tags:        []string{"postgres"},
-		DBName:      DefaultDBName,
-		DBUser:      DefaultDBUser,
+		Tags:        []string{"gitea"},
+		DBPort:      5432,
+		DBName:      "giteadb",
+		DBUser:      "gitea",
+		S3Bucket:    "gitea",
+		S3UseSSL:    false,
 	}
 }
 
@@ -105,7 +84,7 @@ func NewDeployerFromEnv(config Config) (*Deployer, error) {
 
 	token := os.Getenv("SLICER_TOKEN")
 
-	client := sdk.NewSlicerClient(baseURL, token, "slicer-postgres/1.0", nil)
+	client := sdk.NewSlicerClient(baseURL, token, "slicer-gitea/1.0", nil)
 
 	return &Deployer{
 		client: client,
@@ -113,29 +92,9 @@ func NewDeployerFromEnv(config Config) (*Deployer, error) {
 	}, nil
 }
 
-func (d *Deployer) Deploy(ctx context.Context) (*DeployResponse, error) {
-	// Generate password if not already set
-	password := d.config.DBPass
-	if password == "" {
-		var err error
-		password, err = GeneratePassword(24)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate password: %w", err)
-		}
-	}
-
-	dbName := d.config.DBName
-	if dbName == "" {
-		dbName = DefaultDBName
-	}
-
-	dbUser := d.config.DBUser
-	if dbUser == "" {
-		dbUser = DefaultDBUser
-	}
-
-	// Generate userdata with credentials
-	userdata := generateUserdata(dbName, dbUser, password)
+func (d *Deployer) Deploy(ctx context.Context) (*sdk.SlicerCreateNodeResponse, error) {
+	// Generate userdata with database config
+	userdata := generateUserdata(d.config)
 
 	req := sdk.SlicerCreateNodeRequest{
 		RamGB:    d.config.RAMGB,
@@ -155,27 +114,27 @@ func (d *Deployer) Deploy(ctx context.Context) (*DeployResponse, error) {
 		req.Tags = d.config.Tags
 	}
 
-	resp, err := d.client.CreateNode(ctx, d.config.HostGroup, req)
-	if err != nil {
-		return nil, err
-	}
-
-	return &DeployResponse{
-		SlicerCreateNodeResponse: resp,
-		Credentials: Credentials{
-			DBName: dbName,
-			DBUser: dbUser,
-			DBPass: password,
-		},
-	}, nil
+	return d.client.CreateNode(ctx, d.config.HostGroup, req)
 }
 
 // generateUserdata replaces placeholders in the userdata template
-func generateUserdata(dbName, dbUser, password string) string {
+func generateUserdata(config Config) string {
 	userdata := userdataTemplate
-	userdata = strings.ReplaceAll(userdata, "{{POSTGRES_DB}}", dbName)
-	userdata = strings.ReplaceAll(userdata, "{{POSTGRES_USER}}", dbUser)
-	userdata = strings.ReplaceAll(userdata, "{{POSTGRES_PASSWORD}}", password)
+	userdata = strings.ReplaceAll(userdata, "{{DB_HOST}}", config.DBHost)
+	userdata = strings.ReplaceAll(userdata, "{{DB_PORT}}", fmt.Sprintf("%d", config.DBPort))
+	userdata = strings.ReplaceAll(userdata, "{{DB_NAME}}", config.DBName)
+	userdata = strings.ReplaceAll(userdata, "{{DB_USER}}", config.DBUser)
+	userdata = strings.ReplaceAll(userdata, "{{DB_PASS}}", config.DBPass)
+	// S3 storage
+	userdata = strings.ReplaceAll(userdata, "{{S3_ENDPOINT}}", config.S3Endpoint)
+	userdata = strings.ReplaceAll(userdata, "{{S3_ACCESS_KEY}}", config.S3AccessKey)
+	userdata = strings.ReplaceAll(userdata, "{{S3_SECRET_KEY}}", config.S3SecretKey)
+	userdata = strings.ReplaceAll(userdata, "{{S3_BUCKET}}", config.S3Bucket)
+	s3UseSSL := "false"
+	if config.S3UseSSL {
+		s3UseSSL = "true"
+	}
+	userdata = strings.ReplaceAll(userdata, "{{S3_USE_SSL}}", s3UseSSL)
 	return userdata
 }
 
@@ -212,7 +171,7 @@ func GenerateYAML(config Config, githubUser string) string {
     network:
       bridge: br%s0
       tap_prefix: %stap
-      gateway: 192.168.139.1/24
+      gateway: 192.168.141.1/24
 
   github_user: %s
 

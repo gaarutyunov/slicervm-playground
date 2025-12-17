@@ -1,11 +1,9 @@
-package postgres
+package runner
 
 import (
 	"context"
-	"crypto/rand"
 	_ "embed"
 	"fmt"
-	"math/big"
 	"os"
 	"strings"
 
@@ -20,13 +18,8 @@ const (
 	DefaultVCPU        = 2
 	DefaultRAMGB       = 4
 	DefaultStorageSize = "25G"
-	DefaultPort        = 5432
-	DefaultDBName      = "giteadb"
-	DefaultDBUser      = "gitea"
+	DefaultVersion     = "0.2.11"
 )
-
-// alphanumeric characters for password generation (no special chars)
-const alphanumeric = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 type Config struct {
 	HostGroup   string
@@ -36,36 +29,12 @@ type Config struct {
 	SSHKeys     []string
 	GitHubUser  string
 	Tags        []string
-	// PostgreSQL specific
-	DBName string
-	DBUser string
-	DBPass string
-}
-
-// Credentials holds the generated PostgreSQL credentials
-type Credentials struct {
-	DBName string
-	DBUser string
-	DBPass string
-}
-
-// DeployResponse contains VM info and credentials
-type DeployResponse struct {
-	*sdk.SlicerCreateNodeResponse
-	Credentials Credentials
-}
-
-// GeneratePassword creates a cryptographically secure random alphanumeric password
-func GeneratePassword(length int) (string, error) {
-	result := make([]byte, length)
-	for i := 0; i < length; i++ {
-		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphanumeric))))
-		if err != nil {
-			return "", fmt.Errorf("failed to generate random password: %w", err)
-		}
-		result[i] = alphanumeric[num.Int64()]
-	}
-	return string(result), nil
+	// Runner configuration
+	GiteaURL    string // Gitea instance URL (e.g., http://192.168.137.10:3000)
+	RunnerToken string // Registration token from Gitea admin
+	RunnerName  string // Optional runner name
+	Labels      string // Optional labels (e.g., ubuntu-latest:docker://node:16-bullseye)
+	Version     string // act_runner version
 }
 
 func DefaultConfig() Config {
@@ -79,9 +48,9 @@ func DefaultConfig() Config {
 		VCPU:        DefaultVCPU,
 		RAMGB:       DefaultRAMGB,
 		StorageSize: DefaultStorageSize,
-		Tags:        []string{"postgres"},
-		DBName:      DefaultDBName,
-		DBUser:      DefaultDBUser,
+		Tags:        []string{"runner"},
+		Version:     DefaultVersion,
+		Labels:      "ubuntu-latest:docker://node:16-bullseye,ubuntu-22.04:docker://node:16-bullseye,ubuntu-20.04:docker://node:16-bullseye",
 	}
 }
 
@@ -105,7 +74,7 @@ func NewDeployerFromEnv(config Config) (*Deployer, error) {
 
 	token := os.Getenv("SLICER_TOKEN")
 
-	client := sdk.NewSlicerClient(baseURL, token, "slicer-postgres/1.0", nil)
+	client := sdk.NewSlicerClient(baseURL, token, "slicer-runner/1.0", nil)
 
 	return &Deployer{
 		client: client,
@@ -113,29 +82,8 @@ func NewDeployerFromEnv(config Config) (*Deployer, error) {
 	}, nil
 }
 
-func (d *Deployer) Deploy(ctx context.Context) (*DeployResponse, error) {
-	// Generate password if not already set
-	password := d.config.DBPass
-	if password == "" {
-		var err error
-		password, err = GeneratePassword(24)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate password: %w", err)
-		}
-	}
-
-	dbName := d.config.DBName
-	if dbName == "" {
-		dbName = DefaultDBName
-	}
-
-	dbUser := d.config.DBUser
-	if dbUser == "" {
-		dbUser = DefaultDBUser
-	}
-
-	// Generate userdata with credentials
-	userdata := generateUserdata(dbName, dbUser, password)
+func (d *Deployer) Deploy(ctx context.Context) (*sdk.SlicerCreateNodeResponse, error) {
+	userdata := generateUserdata(d.config)
 
 	req := sdk.SlicerCreateNodeRequest{
 		RamGB:    d.config.RAMGB,
@@ -155,27 +103,16 @@ func (d *Deployer) Deploy(ctx context.Context) (*DeployResponse, error) {
 		req.Tags = d.config.Tags
 	}
 
-	resp, err := d.client.CreateNode(ctx, d.config.HostGroup, req)
-	if err != nil {
-		return nil, err
-	}
-
-	return &DeployResponse{
-		SlicerCreateNodeResponse: resp,
-		Credentials: Credentials{
-			DBName: dbName,
-			DBUser: dbUser,
-			DBPass: password,
-		},
-	}, nil
+	return d.client.CreateNode(ctx, d.config.HostGroup, req)
 }
 
-// generateUserdata replaces placeholders in the userdata template
-func generateUserdata(dbName, dbUser, password string) string {
+func generateUserdata(config Config) string {
 	userdata := userdataTemplate
-	userdata = strings.ReplaceAll(userdata, "{{POSTGRES_DB}}", dbName)
-	userdata = strings.ReplaceAll(userdata, "{{POSTGRES_USER}}", dbUser)
-	userdata = strings.ReplaceAll(userdata, "{{POSTGRES_PASSWORD}}", password)
+	userdata = strings.ReplaceAll(userdata, "{{GITEA_URL}}", config.GiteaURL)
+	userdata = strings.ReplaceAll(userdata, "{{RUNNER_TOKEN}}", config.RunnerToken)
+	userdata = strings.ReplaceAll(userdata, "{{RUNNER_NAME}}", config.RunnerName)
+	userdata = strings.ReplaceAll(userdata, "{{RUNNER_LABELS}}", config.Labels)
+	userdata = strings.ReplaceAll(userdata, "{{RUNNER_VERSION}}", config.Version)
 	return userdata
 }
 
@@ -212,7 +149,7 @@ func GenerateYAML(config Config, githubUser string) string {
     network:
       bridge: br%s0
       tap_prefix: %stap
-      gateway: 192.168.139.1/24
+      gateway: 192.168.142.1/24
 
   github_user: %s
 
