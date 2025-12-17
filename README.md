@@ -9,7 +9,11 @@ This repository contains Mage targets for deploying various workloads on Slicer 
 - **BuildKit** - Remote container image builder
 - **OpenFaaS Edge** - Serverless functions platform
 - **RustFS** - High-performance S3-compatible object storage
+- **PostgreSQL** - Database server (configured for Gitea)
+- **Gitea** - Self-hosted Git service with Actions support
+- **Gitea Runner** - CI/CD runner for Gitea Actions
 - **K3s** - Autoscaling Kubernetes cluster with cluster-autoscaler
+- **Crossplane** - Kubernetes-native infrastructure management
 
 ## Prerequisites
 
@@ -63,6 +67,63 @@ mage rustfs:delete <hostname>     # Delete a RustFS VM
 mage rustfs:logs <hostname>       # Show serial console logs
 ```
 
+### PostgreSQL
+
+```bash
+mage postgres:deploy              # Create a new PostgreSQL VM
+mage postgres:list                # List all PostgreSQL VMs
+mage postgres:delete <hostname>   # Delete a PostgreSQL VM
+mage postgres:logs <hostname>     # Show serial console logs
+```
+
+### Gitea Stack
+
+Deploy a complete Gitea instance with PostgreSQL database, S3 storage, and CI/CD runner.
+
+#### 1. Deploy Dependencies
+
+```bash
+# Deploy RustFS for S3 storage (note the access/secret keys)
+mage rustfs:deploy
+
+# Deploy PostgreSQL database (note the password)
+mage postgres:deploy
+```
+
+#### 2. Deploy Gitea
+
+```bash
+GITEA_DB_PASS=<postgres-password> \
+GITEA_S3_ACCESS_KEY=<rustfs-access-key> \
+GITEA_S3_SECRET_KEY=<rustfs-secret-key> \
+mage gitea:deploy
+```
+
+#### 3. Complete Setup
+
+1. Open Gitea web UI (http://<gitea-ip>:3000)
+2. Database and S3 storage are pre-configured
+3. Create your admin account
+4. Get runner token from Admin → Actions → Runners
+
+#### 4. Deploy Runner
+
+```bash
+RUNNER_TOKEN=<token-from-gitea> mage runner:deploy
+```
+
+#### Gitea Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GITEA_DB_PASS` | PostgreSQL password | (required) |
+| `GITEA_DB_HOST` | PostgreSQL host | (auto-detected) |
+| `GITEA_S3_ACCESS_KEY` | RustFS access key | (required) |
+| `GITEA_S3_SECRET_KEY` | RustFS secret key | (required) |
+| `GITEA_S3_ENDPOINT` | S3 endpoint | (auto-detected) |
+| `RUNNER_TOKEN` | Runner registration token | (required) |
+| `GITEA_URL` | Gitea instance URL | (auto-detected) |
+
 ### K3s (Autoscaling Kubernetes)
 
 Deploy an autoscaling K3s cluster on Slicer VMs.
@@ -114,6 +175,15 @@ mage k3s:deleteCP <hostname>      # Delete control plane VM
 mage k3s:deleteAgent <hostname>   # Delete agent VM
 ```
 
+### Crossplane
+
+Install Crossplane on your K3s cluster for Kubernetes-native infrastructure management.
+
+```bash
+mage crossplane:install           # Install Crossplane via Helm
+mage crossplane:uninstall         # Uninstall Crossplane
+```
+
 ## VM Specifications
 
 | Workload | vCPU | RAM | Storage |
@@ -121,6 +191,9 @@ mage k3s:deleteAgent <hostname>   # Delete agent VM
 | BuildKit | 2 | 4 GB | 25 GB |
 | OpenFaaS | 2 | 4 GB | 25 GB |
 | RustFS | 2 | 4 GB | 25 GB |
+| PostgreSQL | 2 | 4 GB | 25 GB |
+| Gitea | 2 | 4 GB | 25 GB |
+| Runner | 2 | 4 GB | 25 GB |
 | K3s CP | 2 | 4 GB | 25 GB |
 | K3s Agent | 2 | 4 GB | 25 GB |
 
