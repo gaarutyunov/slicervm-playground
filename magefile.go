@@ -12,8 +12,10 @@ import (
 	sdk "github.com/slicervm/sdk"
 
 	"github.com/gaarutyunov/slicer/pkg/buildkit"
+	"github.com/gaarutyunov/slicer/pkg/crossplane"
 	"github.com/gaarutyunov/slicer/pkg/k3s"
 	"github.com/gaarutyunov/slicer/pkg/openfaas"
+	"github.com/gaarutyunov/slicer/pkg/postgres"
 	"github.com/gaarutyunov/slicer/pkg/rustfs"
 	"github.com/magefile/mage/mg"
 )
@@ -385,6 +387,280 @@ func (Rustfs) YAML() error {
 
 	config := rustfs.DefaultConfig()
 	fmt.Println(rustfs.GenerateYAML(config, githubUser))
+	return nil
+}
+
+// PostgreSQL targets
+type Postgres mg.Namespace
+
+// Deploy creates a new PostgreSQL VM
+// SSH_KEY_PATH env var specifies an additional SSH public key file (default: ~/.ssh/id_ed25519.pub)
+// POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD env vars configure the database (optional)
+func (Postgres) Deploy(ctx context.Context) error {
+	config := postgres.DefaultConfig()
+
+	if gh := os.Getenv("GITHUB_USER"); gh != "" {
+		config.GitHubUser = gh
+	}
+
+	if key := loadSSHKey(); key != "" {
+		config.SSHKeys = append(config.SSHKeys, key)
+	}
+
+	// PostgreSQL specific configuration
+	if db := os.Getenv("POSTGRES_DB"); db != "" {
+		config.DBName = db
+	}
+	if user := os.Getenv("POSTGRES_USER"); user != "" {
+		config.DBUser = user
+	}
+	if pass := os.Getenv("POSTGRES_PASSWORD"); pass != "" {
+		config.DBPass = pass
+	}
+
+	deployer, err := postgres.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	resp, err := deployer.Deploy(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to deploy postgres: %w", err)
+	}
+
+	fmt.Printf("PostgreSQL VM deployed:\n")
+	fmt.Printf("  Hostname: %s\n", resp.Hostname)
+	fmt.Printf("  IP: %s\n", resp.IP)
+	fmt.Printf("  Created: %s\n", resp.CreatedAt)
+	fmt.Printf("\nCredentials (save these - password is randomly generated):\n")
+	fmt.Printf("  Database: %s\n", resp.Credentials.DBName)
+	fmt.Printf("  Username: %s\n", resp.Credentials.DBUser)
+	fmt.Printf("  Password: %s\n", resp.Credentials.DBPass)
+	fmt.Printf("\nNext steps:\n")
+	fmt.Printf("  1. SSH: ssh ubuntu@%s\n", resp.IP)
+	fmt.Printf("  2. Connect: psql -h %s -U %s -d %s\n", resp.IP, resp.Credentials.DBUser, resp.Credentials.DBName)
+
+	return nil
+}
+
+// List shows all PostgreSQL VMs (filtered by "postgres" tag)
+func (Postgres) List(ctx context.Context) error {
+	config := postgres.DefaultConfig()
+
+	deployer, err := postgres.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	nodes, err := deployer.List(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list postgres nodes: %w", err)
+	}
+
+	printNodeList(nodes, "postgres", "PostgreSQL")
+	return nil
+}
+
+// Delete removes a PostgreSQL VM by hostname
+func (Postgres) Delete(ctx context.Context, hostname string) error {
+	config := postgres.DefaultConfig()
+
+	deployer, err := postgres.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	if err := deployer.Delete(ctx, hostname); err != nil {
+		return fmt.Errorf("failed to delete postgres VM %s: %w", hostname, err)
+	}
+
+	fmt.Printf("PostgreSQL VM %s deleted\n", hostname)
+	return nil
+}
+
+// Logs shows serial console logs for a PostgreSQL VM
+func (Postgres) Logs(ctx context.Context, hostname string) error {
+	config := postgres.DefaultConfig()
+
+	deployer, err := postgres.NewDeployerFromEnv(config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	logs, err := deployer.Logs(ctx, hostname, 50)
+	if err != nil {
+		return fmt.Errorf("failed to get logs for %s: %w", hostname, err)
+	}
+
+	fmt.Println(logs)
+	return nil
+}
+
+// Userdata prints the PostgreSQL userdata script
+func (Postgres) Userdata() {
+	fmt.Println(postgres.Userdata())
+}
+
+// YAML generates a Slicer config YAML for PostgreSQL
+func (Postgres) YAML() error {
+	githubUser := os.Getenv("GITHUB_USER")
+	if githubUser == "" {
+		return fmt.Errorf("GITHUB_USER environment variable is required")
+	}
+
+	config := postgres.DefaultConfig()
+	fmt.Println(postgres.GenerateYAML(config, githubUser))
+	return nil
+}
+
+// Crossplane targets for Kubernetes control plane
+type Crossplane mg.Namespace
+
+// Install deploys Crossplane to the Kubernetes cluster via Helm
+// Uses KUBECONFIG env var or ~/.kube/config
+func (Crossplane) Install(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := crossplane.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	fmt.Println("Verifying cluster connection...")
+	if err := provisioner.VerifyClusterConnection(ctx); err != nil {
+		return fmt.Errorf("cluster connection failed: %w", err)
+	}
+	fmt.Println("Connected to cluster")
+
+	// Check if already installed
+	installed, err := provisioner.IsInstalled(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check installation status: %w", err)
+	}
+	if installed {
+		fmt.Println("Crossplane is already installed, upgrading...")
+	} else {
+		fmt.Println("Installing Crossplane...")
+	}
+
+	config := crossplane.DefaultConfig()
+	if err := provisioner.Install(ctx, config); err != nil {
+		return fmt.Errorf("failed to install crossplane: %w", err)
+	}
+
+	fmt.Println("\nCrossplane installed successfully!")
+	fmt.Println("Use 'mage crossplane:status' to check status")
+	fmt.Println("Use 'mage crossplane:logs' to view logs")
+	return nil
+}
+
+// Uninstall removes Crossplane from the Kubernetes cluster
+func (Crossplane) Uninstall(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := crossplane.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	fmt.Println("Uninstalling Crossplane...")
+	if err := provisioner.Uninstall(ctx); err != nil {
+		return fmt.Errorf("failed to uninstall crossplane: %w", err)
+	}
+
+	fmt.Println("Crossplane uninstalled successfully!")
+	return nil
+}
+
+// Status shows the status of Crossplane deployments and pods
+func (Crossplane) Status(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := crossplane.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	// Check if installed
+	installed, err := provisioner.IsInstalled(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check installation status: %w", err)
+	}
+	if !installed {
+		fmt.Println("Crossplane is not installed")
+		return nil
+	}
+
+	// Get deployments
+	deployments, err := provisioner.GetDeployments(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get deployments: %w", err)
+	}
+
+	fmt.Printf("Crossplane Deployments (%d):\n", len(deployments))
+	for _, d := range deployments {
+		fmt.Printf("  - %s: %d/%d ready\n", d.Name, d.ReadyReplicas, d.Replicas)
+	}
+
+	// Get pods
+	pods, err := provisioner.GetPods(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get pods: %w", err)
+	}
+
+	fmt.Printf("\nCrossplane Pods (%d):\n", len(pods))
+	for _, pod := range pods {
+		ready := 0
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.Ready {
+				ready++
+			}
+		}
+		fmt.Printf("  - %s [%s] %d/%d ready\n", pod.Name, pod.Status.Phase, ready, len(pod.Status.ContainerStatuses))
+	}
+
+	return nil
+}
+
+// Logs shows logs from a Crossplane pod
+// Usage: mage crossplane:logs [pod-name]
+// If no pod name is given, shows logs from the first crossplane pod
+func (Crossplane) Logs(ctx context.Context, podName string) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := crossplane.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	// If no pod name provided, get the first crossplane pod
+	if podName == "" {
+		pods, err := provisioner.GetPods(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get pods: %w", err)
+		}
+		if len(pods) == 0 {
+			return fmt.Errorf("no crossplane pods found")
+		}
+		// Find the main crossplane pod
+		for _, pod := range pods {
+			if strings.HasPrefix(pod.Name, "crossplane-") && !strings.Contains(pod.Name, "rbac") {
+				podName = pod.Name
+				break
+			}
+		}
+		if podName == "" {
+			podName = pods[0].Name
+		}
+	}
+
+	fmt.Printf("Logs from pod %s:\n\n", podName)
+	logs, err := provisioner.GetLogs(ctx, podName, 100)
+	if err != nil {
+		return fmt.Errorf("failed to get logs: %w", err)
+	}
+
+	fmt.Println(logs)
 	return nil
 }
 

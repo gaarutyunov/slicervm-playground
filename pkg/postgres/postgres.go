@@ -1,11 +1,11 @@
-package rustfs
+package postgres
 
 import (
 	"context"
 	"crypto/rand"
 	_ "embed"
-	"encoding/base64"
 	"fmt"
+	"math/big"
 	"os"
 	"strings"
 
@@ -16,15 +16,17 @@ import (
 var userdataTemplate string
 
 const (
-	DefaultUser = "admin"
-)
-
-const (
 	DefaultHostGroup   = "api"
 	DefaultVCPU        = 2
-	DefaultRAMGB       = 4 // Based on RustFS performance test recommendations
+	DefaultRAMGB       = 4
 	DefaultStorageSize = "25G"
+	DefaultPort        = 5432
+	DefaultDBName      = "app"
+	DefaultDBUser      = "app"
 )
+
+// alphanumeric characters for password generation (no special chars)
+const alphanumeric = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 type Config struct {
 	HostGroup   string
@@ -34,14 +36,17 @@ type Config struct {
 	SSHKeys     []string
 	GitHubUser  string
 	Tags        []string
-	User        string
-	Password    string
+	// PostgreSQL specific
+	DBName string
+	DBUser string
+	DBPass string
 }
 
-// Credentials holds the generated RustFS credentials
+// Credentials holds the generated PostgreSQL credentials
 type Credentials struct {
-	User     string
-	Password string
+	DBName string
+	DBUser string
+	DBPass string
 }
 
 // DeployResponse contains VM info and credentials
@@ -50,20 +55,17 @@ type DeployResponse struct {
 	Credentials Credentials
 }
 
-// GeneratePassword creates a cryptographically secure random password
+// GeneratePassword creates a cryptographically secure random alphanumeric password
 func GeneratePassword(length int) (string, error) {
-	bytes := make([]byte, length)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", fmt.Errorf("failed to generate random password: %w", err)
+	result := make([]byte, length)
+	for i := 0; i < length; i++ {
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphanumeric))))
+		if err != nil {
+			return "", fmt.Errorf("failed to generate random password: %w", err)
+		}
+		result[i] = alphanumeric[num.Int64()]
 	}
-	// Use URL-safe base64 and trim to desired length
-	password := base64.URLEncoding.EncodeToString(bytes)
-	// Remove padding and take only the requested length
-	password = strings.TrimRight(password, "=")
-	if len(password) > length {
-		password = password[:length]
-	}
-	return password, nil
+	return string(result), nil
 }
 
 func DefaultConfig() Config {
@@ -77,8 +79,9 @@ func DefaultConfig() Config {
 		VCPU:        DefaultVCPU,
 		RAMGB:       DefaultRAMGB,
 		StorageSize: DefaultStorageSize,
-		Tags:        []string{"rustfs"},
-		User:        DefaultUser,
+		Tags:        []string{"postgres"},
+		DBName:      DefaultDBName,
+		DBUser:      DefaultDBUser,
 	}
 }
 
@@ -102,7 +105,7 @@ func NewDeployerFromEnv(config Config) (*Deployer, error) {
 
 	token := os.Getenv("SLICER_TOKEN")
 
-	client := sdk.NewSlicerClient(baseURL, token, "slicer-rustfs/1.0", nil)
+	client := sdk.NewSlicerClient(baseURL, token, "slicer-postgres/1.0", nil)
 
 	return &Deployer{
 		client: client,
@@ -112,7 +115,7 @@ func NewDeployerFromEnv(config Config) (*Deployer, error) {
 
 func (d *Deployer) Deploy(ctx context.Context) (*DeployResponse, error) {
 	// Generate password if not already set
-	password := d.config.Password
+	password := d.config.DBPass
 	if password == "" {
 		var err error
 		password, err = GeneratePassword(24)
@@ -121,13 +124,18 @@ func (d *Deployer) Deploy(ctx context.Context) (*DeployResponse, error) {
 		}
 	}
 
-	user := d.config.User
-	if user == "" {
-		user = DefaultUser
+	dbName := d.config.DBName
+	if dbName == "" {
+		dbName = DefaultDBName
+	}
+
+	dbUser := d.config.DBUser
+	if dbUser == "" {
+		dbUser = DefaultDBUser
 	}
 
 	// Generate userdata with credentials
-	userdata := generateUserdata(user, password)
+	userdata := generateUserdata(dbName, dbUser, password)
 
 	req := sdk.SlicerCreateNodeRequest{
 		RamGB:    d.config.RAMGB,
@@ -155,17 +163,19 @@ func (d *Deployer) Deploy(ctx context.Context) (*DeployResponse, error) {
 	return &DeployResponse{
 		SlicerCreateNodeResponse: resp,
 		Credentials: Credentials{
-			User:     user,
-			Password: password,
+			DBName: dbName,
+			DBUser: dbUser,
+			DBPass: password,
 		},
 	}, nil
 }
 
 // generateUserdata replaces placeholders in the userdata template
-func generateUserdata(user, password string) string {
+func generateUserdata(dbName, dbUser, password string) string {
 	userdata := userdataTemplate
-	userdata = strings.ReplaceAll(userdata, "{{RUSTFS_USER}}", user)
-	userdata = strings.ReplaceAll(userdata, "{{RUSTFS_PASSWORD}}", password)
+	userdata = strings.ReplaceAll(userdata, "{{POSTGRES_DB}}", dbName)
+	userdata = strings.ReplaceAll(userdata, "{{POSTGRES_USER}}", dbUser)
+	userdata = strings.ReplaceAll(userdata, "{{POSTGRES_PASSWORD}}", password)
 	return userdata
 }
 
@@ -202,7 +212,7 @@ func GenerateYAML(config Config, githubUser string) string {
     network:
       bridge: br%s0
       tap_prefix: %stap
-      gateway: 192.168.140.1/24
+      gateway: 192.168.139.1/24
 
   github_user: %s
 
