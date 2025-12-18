@@ -14,6 +14,8 @@ This repository contains Mage targets for deploying various workloads on Slicer 
 - **Gitea Runner** - CI/CD runner for Gitea Actions
 - **K3s** - Autoscaling Kubernetes cluster with cluster-autoscaler
 - **Crossplane** - Kubernetes-native infrastructure management
+- **Grafana Stack** - Prometheus, Grafana, and Alertmanager for monitoring
+- **cert-manager** - Automatic TLS certificate management
 
 ## Prerequisites
 
@@ -183,6 +185,101 @@ Install Crossplane on your K3s cluster for Kubernetes-native infrastructure mana
 mage crossplane:install           # Install Crossplane via Helm
 mage crossplane:uninstall         # Uninstall Crossplane
 ```
+
+### Grafana Stack (Prometheus + Grafana + Alertmanager)
+
+Deploy the kube-prometheus-stack for monitoring your K3s cluster and external hosts.
+
+```bash
+mage grafana:install              # Install monitoring stack
+mage grafana:uninstall            # Uninstall monitoring stack
+mage grafana:status               # Show pod/deployment status
+mage grafana:services             # Show service endpoints
+mage grafana:password             # Get Grafana admin password
+mage grafana:logs [pod-name]      # View pod logs
+```
+
+#### Accessing Grafana
+
+```bash
+# Get credentials and endpoints
+mage grafana:password
+mage grafana:services
+
+# Access Grafana at http://<k3s-node-ip>:<grafana-nodeport>
+# Default user: admin
+```
+
+#### Pre-installed Dashboards
+
+- **Node Exporter Full** (ID 1860) - Comprehensive Linux server monitoring (CPU, memory, disk, network)
+- Built-in Kubernetes dashboards for cluster monitoring
+
+#### Monitoring External Hosts
+
+Prometheus accepts remote write at `http://<k3s-node-ip>:30090/api/v1/write`.
+
+Install Grafana Alloy on your external host:
+
+```bash
+# Install Alloy
+curl -fsSL https://apt.grafana.com/gpg.key | gpg --dearmor -o /etc/apt/keyrings/grafana.gpg
+echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" > /etc/apt/sources.list.d/grafana.list
+apt update && apt install -y alloy
+
+# Configure /etc/alloy/config.alloy
+cat > /etc/alloy/config.alloy << 'EOF'
+prometheus.exporter.unix "host" {
+  include_exporter_metrics = true
+}
+
+prometheus.scrape "node" {
+  targets    = prometheus.exporter.unix.host.targets
+  forward_to = [prometheus.remote_write.k3s.receiver]
+}
+
+prometheus.remote_write "k3s" {
+  endpoint {
+    url = "http://<k3s-node-ip>:30090/api/v1/write"
+  }
+  external_labels = {
+    instance = "my-server",
+    job      = "node-exporter",
+  }
+}
+EOF
+
+systemctl enable --now alloy
+```
+
+#### Grafana Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GRAFANA_PASSWORD` | Admin password | (auto-generated) |
+| `GRAFANA_INGRESS_HOST` | Enable ingress with hostname | - |
+| `GRAFANA_TLS` | Enable TLS via cert-manager | `false` |
+| `PROMETHEUS_RETENTION` | Data retention in days | `10` |
+| `PROMETHEUS_STORAGE` | Storage size | `10Gi` |
+
+### cert-manager
+
+Install cert-manager for automatic TLS certificate management.
+
+```bash
+mage certManager:install          # Install cert-manager
+mage certManager:uninstall        # Uninstall cert-manager
+mage certManager:status           # Show status
+mage certManager:clusterIssuer    # Create Let's Encrypt ClusterIssuer
+mage certManager:clusterIssuerList # List ClusterIssuers
+```
+
+#### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ACME_EMAIL` | Email for Let's Encrypt | (required for ClusterIssuer) |
+| `ACME_STAGING` | Use staging server | `false` |
 
 ## VM Specifications
 
