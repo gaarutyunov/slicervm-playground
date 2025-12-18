@@ -12,8 +12,11 @@ import (
 	sdk "github.com/slicervm/sdk"
 
 	"github.com/gaarutyunov/slicer/pkg/buildkit"
+	"github.com/gaarutyunov/slicer/pkg/certmanager"
 	"github.com/gaarutyunov/slicer/pkg/crossplane"
+	xprunner "github.com/gaarutyunov/slicer/pkg/crossplane/runner"
 	"github.com/gaarutyunov/slicer/pkg/gitea"
+	"github.com/gaarutyunov/slicer/pkg/grafana"
 	"github.com/gaarutyunov/slicer/pkg/k3s"
 	"github.com/gaarutyunov/slicer/pkg/openfaas"
 	"github.com/gaarutyunov/slicer/pkg/postgres"
@@ -1058,6 +1061,554 @@ func (Crossplane) Logs(ctx context.Context, podName string) error {
 	return nil
 }
 
+// Grafana targets for monitoring stack (Prometheus, Grafana, Alertmanager)
+type Grafana mg.Namespace
+
+// Install deploys the Grafana stack (kube-prometheus-stack) to the Kubernetes cluster via Helm
+// Uses KUBECONFIG env var or ~/.kube/config
+// Optional env vars: GRAFANA_PASSWORD (admin password), PROMETHEUS_RETENTION (days), PROMETHEUS_STORAGE (size)
+func (Grafana) Install(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := grafana.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	fmt.Println("Verifying cluster connection...")
+	if err := provisioner.VerifyClusterConnection(ctx); err != nil {
+		return fmt.Errorf("cluster connection failed: %w", err)
+	}
+	fmt.Println("Connected to cluster")
+
+	// Check if already installed
+	installed, err := provisioner.IsInstalled(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check installation status: %w", err)
+	}
+	if installed {
+		fmt.Println("Grafana stack is already installed, upgrading...")
+	} else {
+		fmt.Println("Installing Grafana stack (kube-prometheus-stack)...")
+	}
+
+	config := grafana.DefaultConfig()
+
+	// Optional config from environment
+	if pass := os.Getenv("GRAFANA_PASSWORD"); pass != "" {
+		config.AdminPassword = pass
+	}
+	if retention := os.Getenv("PROMETHEUS_RETENTION"); retention != "" {
+		fmt.Sscanf(retention, "%d", &config.PrometheusRetentionDays)
+	}
+	if storage := os.Getenv("PROMETHEUS_STORAGE"); storage != "" {
+		config.PrometheusStorageSize = storage
+	}
+
+	// Ingress configuration
+	if host := os.Getenv("GRAFANA_INGRESS_HOST"); host != "" {
+		config.IngressEnabled = true
+		config.IngressHost = host
+	}
+	if class := os.Getenv("GRAFANA_INGRESS_CLASS"); class != "" {
+		config.IngressClassName = class
+	}
+
+	// TLS configuration
+	if os.Getenv("GRAFANA_TLS") == "true" || os.Getenv("GRAFANA_CLUSTER_ISSUER") != "" {
+		config.TLSEnabled = true
+	}
+	if issuer := os.Getenv("GRAFANA_CLUSTER_ISSUER"); issuer != "" {
+		config.ClusterIssuer = issuer
+	}
+
+	if err := provisioner.Install(ctx, config); err != nil {
+		return fmt.Errorf("failed to install grafana stack: %w", err)
+	}
+
+	fmt.Println("\nGrafana stack installed successfully!")
+	fmt.Printf("\nCredentials (save these):\n")
+	fmt.Printf("  Username: admin\n")
+	fmt.Printf("  Password: %s\n", config.AdminPassword)
+	if config.IngressEnabled {
+		if config.TLSEnabled {
+			fmt.Printf("\nIngress: https://%s\n", config.IngressHost)
+		} else {
+			fmt.Printf("\nIngress: http://%s\n", config.IngressHost)
+		}
+	}
+	fmt.Println("\nUse 'mage grafana:status' to check status")
+	fmt.Println("Use 'mage grafana:services' to get service endpoints")
+	return nil
+}
+
+// Uninstall removes the Grafana stack from the Kubernetes cluster
+func (Grafana) Uninstall(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := grafana.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	fmt.Println("Uninstalling Grafana stack...")
+	if err := provisioner.Uninstall(ctx); err != nil {
+		return fmt.Errorf("failed to uninstall grafana stack: %w", err)
+	}
+
+	fmt.Println("Grafana stack uninstalled successfully!")
+	return nil
+}
+
+// Status shows the status of Grafana stack deployments and pods
+func (Grafana) Status(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := grafana.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	// Check if installed
+	installed, err := provisioner.IsInstalled(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check installation status: %w", err)
+	}
+	if !installed {
+		fmt.Println("Grafana stack is not installed")
+		return nil
+	}
+
+	// Get deployments
+	deployments, err := provisioner.GetDeployments(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get deployments: %w", err)
+	}
+
+	fmt.Printf("Deployments (%d):\n", len(deployments))
+	for _, d := range deployments {
+		fmt.Printf("  - %s: %d/%d ready\n", d.Name, d.ReadyReplicas, d.Replicas)
+	}
+
+	// Get statefulsets
+	statefulsets, err := provisioner.GetStatefulSets(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get statefulsets: %w", err)
+	}
+
+	fmt.Printf("\nStatefulSets (%d):\n", len(statefulsets))
+	for _, s := range statefulsets {
+		fmt.Printf("  - %s: %d/%d ready\n", s.Name, s.ReadyReplicas, s.Replicas)
+	}
+
+	// Get pods
+	pods, err := provisioner.GetPods(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get pods: %w", err)
+	}
+
+	fmt.Printf("\nPods (%d):\n", len(pods))
+	for _, pod := range pods {
+		ready := 0
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.Ready {
+				ready++
+			}
+		}
+		fmt.Printf("  - %s [%s] %d/%d ready\n", pod.Name, pod.Status.Phase, ready, len(pod.Status.ContainerStatuses))
+	}
+
+	return nil
+}
+
+// Services shows the Grafana stack service endpoints
+func (Grafana) Services(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := grafana.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	services, err := provisioner.GetServices(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get services: %w", err)
+	}
+
+	if len(services) == 0 {
+		fmt.Println("No services found. Is Grafana stack installed?")
+		return nil
+	}
+
+	fmt.Printf("Services (%d):\n", len(services))
+	for _, svc := range services {
+		if svc.NodePort > 0 {
+			fmt.Printf("  - %s [%s] port:%d nodePort:%d\n", svc.Name, svc.Type, svc.Port, svc.NodePort)
+		} else {
+			fmt.Printf("  - %s [%s] port:%d\n", svc.Name, svc.Type, svc.Port)
+		}
+	}
+	return nil
+}
+
+// Password retrieves the Grafana admin password
+func (Grafana) Password(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := grafana.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	password, err := provisioner.GetGrafanaPassword(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get grafana password: %w", err)
+	}
+
+	fmt.Printf("Grafana Admin Password: %s\n", password)
+	fmt.Println("\nUsername: admin")
+	return nil
+}
+
+// Logs shows logs from a Grafana stack pod
+// Usage: mage grafana:logs [pod-name]
+// If no pod name is given, shows logs from the first grafana pod
+func (Grafana) Logs(ctx context.Context, podName string) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := grafana.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	// If no pod name provided, get the first grafana pod
+	if podName == "" {
+		pods, err := provisioner.GetPods(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get pods: %w", err)
+		}
+		if len(pods) == 0 {
+			return fmt.Errorf("no monitoring pods found")
+		}
+		// Find the main grafana pod
+		for _, pod := range pods {
+			if strings.Contains(pod.Name, "grafana") && !strings.Contains(pod.Name, "test") {
+				podName = pod.Name
+				break
+			}
+		}
+		if podName == "" {
+			podName = pods[0].Name
+		}
+	}
+
+	fmt.Printf("Logs from pod %s:\n\n", podName)
+	logs, err := provisioner.GetLogs(ctx, podName, 100)
+	if err != nil {
+		return fmt.Errorf("failed to get logs: %w", err)
+	}
+
+	fmt.Println(logs)
+	return nil
+}
+
+// AddTarget adds an external scrape target to Prometheus
+// Required: SCRAPE_TARGET (host:port, e.g., "192.168.1.100:9100")
+// Optional: SCRAPE_JOB (job name, default: "external"), SCRAPE_INSTANCE (instance label)
+func (Grafana) AddTarget(ctx context.Context) error {
+	target := os.Getenv("SCRAPE_TARGET")
+	if target == "" {
+		return fmt.Errorf("SCRAPE_TARGET environment variable is required (e.g., 192.168.1.100:9100)")
+	}
+
+	jobName := os.Getenv("SCRAPE_JOB")
+	if jobName == "" {
+		jobName = "external"
+	}
+
+	instanceLabel := os.Getenv("SCRAPE_INSTANCE")
+	if instanceLabel == "" {
+		instanceLabel = target
+	}
+
+	kubeconfig := os.Getenv("KUBECONFIG")
+	provisioner, err := grafana.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	// Get existing config
+	existingConfig, err := provisioner.GetAdditionalScrapeConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get existing config: %w", err)
+	}
+
+	// Check if target already exists
+	if strings.Contains(existingConfig, target) {
+		fmt.Printf("Target %s already exists in scrape config\n", target)
+		return nil
+	}
+
+	scrapeTarget := grafana.ScrapeTarget{
+		JobName: jobName,
+		Targets: []string{target},
+		Labels: map[string]string{
+			"instance": instanceLabel,
+		},
+	}
+
+	if err := provisioner.CreateAdditionalScrapeConfig(ctx, []grafana.ScrapeTarget{scrapeTarget}); err != nil {
+		return fmt.Errorf("failed to create scrape config: %w", err)
+	}
+
+	fmt.Printf("Added scrape target:\n")
+	fmt.Printf("  Job: %s\n", jobName)
+	fmt.Printf("  Target: %s\n", target)
+	fmt.Printf("  Instance: %s\n", instanceLabel)
+	fmt.Println("\nIMPORTANT: You need to upgrade Grafana to apply the config:")
+	fmt.Println("  mage grafana:install")
+	fmt.Println("\nMake sure node_exporter is running on the target:")
+	fmt.Println("  curl http://" + target + "/metrics")
+	return nil
+}
+
+// ListTargets shows the current additional scrape targets
+func (Grafana) ListTargets(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	provisioner, err := grafana.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	config, err := provisioner.GetAdditionalScrapeConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get scrape config: %w", err)
+	}
+
+	if config == "" {
+		fmt.Println("No additional scrape targets configured")
+		return nil
+	}
+
+	fmt.Println("Additional scrape config:")
+	fmt.Println(config)
+	return nil
+}
+
+// CertManager targets for TLS certificate management
+type CertManager mg.Namespace
+
+// Install deploys cert-manager to the Kubernetes cluster via Helm
+// Uses KUBECONFIG env var or ~/.kube/config
+func (CertManager) Install(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := certmanager.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	fmt.Println("Verifying cluster connection...")
+	if err := provisioner.VerifyClusterConnection(ctx); err != nil {
+		return fmt.Errorf("cluster connection failed: %w", err)
+	}
+	fmt.Println("Connected to cluster")
+
+	// Check if already installed
+	installed, err := provisioner.IsInstalled(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check installation status: %w", err)
+	}
+	if installed {
+		fmt.Println("cert-manager is already installed, upgrading...")
+	} else {
+		fmt.Println("Installing cert-manager...")
+	}
+
+	config := certmanager.DefaultConfig()
+	if err := provisioner.Install(ctx, config); err != nil {
+		return fmt.Errorf("failed to install cert-manager: %w", err)
+	}
+
+	fmt.Println("\ncert-manager installed successfully!")
+	fmt.Println("Use 'mage certManager:status' to check status")
+	fmt.Println("\nNext steps:")
+	fmt.Println("  1. Create a ClusterIssuer for Let's Encrypt")
+	fmt.Println("  2. Add cert-manager.io/cluster-issuer annotation to ingresses")
+	return nil
+}
+
+// Uninstall removes cert-manager from the Kubernetes cluster
+func (CertManager) Uninstall(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := certmanager.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	fmt.Println("Uninstalling cert-manager...")
+	if err := provisioner.Uninstall(ctx); err != nil {
+		return fmt.Errorf("failed to uninstall cert-manager: %w", err)
+	}
+
+	fmt.Println("cert-manager uninstalled successfully!")
+	return nil
+}
+
+// Status shows the status of cert-manager deployments and pods
+func (CertManager) Status(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := certmanager.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	// Check if installed
+	installed, err := provisioner.IsInstalled(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check installation status: %w", err)
+	}
+	if !installed {
+		fmt.Println("cert-manager is not installed")
+		return nil
+	}
+
+	// Get deployments
+	deployments, err := provisioner.GetDeployments(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get deployments: %w", err)
+	}
+
+	fmt.Printf("Deployments (%d):\n", len(deployments))
+	for _, d := range deployments {
+		fmt.Printf("  - %s: %d/%d ready\n", d.Name, d.ReadyReplicas, d.Replicas)
+	}
+
+	// Get pods
+	pods, err := provisioner.GetPods(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get pods: %w", err)
+	}
+
+	fmt.Printf("\nPods (%d):\n", len(pods))
+	for _, pod := range pods {
+		ready := 0
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.Ready {
+				ready++
+			}
+		}
+		fmt.Printf("  - %s [%s] %d/%d ready\n", pod.Name, pod.Status.Phase, ready, len(pod.Status.ContainerStatuses))
+	}
+
+	return nil
+}
+
+// ClusterIssuer creates a Let's Encrypt ClusterIssuer for automatic TLS certificates
+// Required: ACME_EMAIL env var (your email for Let's Encrypt notifications)
+// Optional: ACME_STAGING=true for testing (uses staging server with fake certs)
+func (CertManager) ClusterIssuer(ctx context.Context) error {
+	email := os.Getenv("ACME_EMAIL")
+	if email == "" {
+		return fmt.Errorf("ACME_EMAIL environment variable is required")
+	}
+
+	kubeconfig := os.Getenv("KUBECONFIG")
+	provisioner, err := certmanager.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	var config certmanager.ClusterIssuerConfig
+	if os.Getenv("ACME_STAGING") == "true" {
+		config = certmanager.StagingClusterIssuerConfig()
+		fmt.Println("Creating Let's Encrypt STAGING ClusterIssuer (for testing)...")
+	} else {
+		config = certmanager.DefaultClusterIssuerConfig()
+		fmt.Println("Creating Let's Encrypt PRODUCTION ClusterIssuer...")
+	}
+	config.Email = email
+
+	if err := provisioner.CreateClusterIssuer(ctx, config); err != nil {
+		return fmt.Errorf("failed to create ClusterIssuer: %w", err)
+	}
+
+	fmt.Printf("\nClusterIssuer '%s' created successfully!\n", config.Name)
+	fmt.Printf("  Server: %s\n", config.Server)
+	fmt.Printf("  Email: %s\n", config.Email)
+	fmt.Printf("  Ingress class: %s\n", config.IngressClass)
+	return nil
+}
+
+// ClusterIssuerList lists all ClusterIssuers in the cluster
+func (CertManager) ClusterIssuerList(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	provisioner, err := certmanager.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	issuers, err := provisioner.GetClusterIssuers(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list ClusterIssuers: %w", err)
+	}
+
+	if len(issuers) == 0 {
+		fmt.Println("No ClusterIssuers found")
+		return nil
+	}
+
+	fmt.Printf("ClusterIssuers (%d):\n", len(issuers))
+	for _, name := range issuers {
+		fmt.Printf("  - %s\n", name)
+	}
+	return nil
+}
+
+// Logs shows logs from a cert-manager pod
+// Usage: mage certManager:logs [pod-name]
+// If no pod name is given, shows logs from the first cert-manager pod
+func (CertManager) Logs(ctx context.Context, podName string) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+
+	provisioner, err := certmanager.NewProvisioner(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create provisioner: %w", err)
+	}
+
+	// If no pod name provided, get the first cert-manager controller pod
+	if podName == "" {
+		pods, err := provisioner.GetPods(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get pods: %w", err)
+		}
+		if len(pods) == 0 {
+			return fmt.Errorf("no cert-manager pods found")
+		}
+		// Find the main cert-manager pod
+		for _, pod := range pods {
+			if strings.Contains(pod.Name, "cert-manager") && !strings.Contains(pod.Name, "webhook") && !strings.Contains(pod.Name, "cainjector") {
+				podName = pod.Name
+				break
+			}
+		}
+		if podName == "" {
+			podName = pods[0].Name
+		}
+	}
+
+	fmt.Printf("Logs from pod %s:\n\n", podName)
+	logs, err := provisioner.GetLogs(ctx, podName, 100)
+	if err != nil {
+		return fmt.Errorf("failed to get logs: %w", err)
+	}
+
+	fmt.Println(logs)
+	return nil
+}
+
 // K3s targets for autoscaling Kubernetes cluster
 type K3s mg.Namespace
 
@@ -1677,6 +2228,210 @@ func (K3s) AutoscalerStressTestCleanup(ctx context.Context) error {
 	fmt.Println("Stress test deployment deleted")
 	fmt.Println("Note: Autoscaler will scale down nodes after cooldown period")
 	return nil
+}
+
+// CrossplaneRunner targets for Gitea Actions Runner via Crossplane
+type CrossplaneRunner mg.Namespace
+
+// Deploy creates a new Gitea Runner VM via Crossplane
+// Required env vars: RUNNER_TOKEN (from Gitea admin/actions/runners)
+// Optional env vars: GITEA_URL (auto-detected from gitea VM), RUNNER_NAME, RUNNER_LABELS, RUNNER_VERSION
+// Crossplane env vars: KUBECONFIG, CROSSPLANE_NAMESPACE (default: default), CROSSPLANE_PROVIDER_CONFIG (default: default)
+func (CrossplaneRunner) Deploy(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	config := xprunner.DefaultConfig()
+
+	if gh := os.Getenv("GITHUB_USER"); gh != "" {
+		config.GitHubUser = gh
+	}
+
+	if key := loadSSHKey(); key != "" {
+		config.SSHKeys = append(config.SSHKeys, key)
+	}
+
+	// Gitea URL - auto-detect from gitea VM if not specified
+	giteaURL := os.Getenv("GITEA_URL")
+	if giteaURL == "" {
+		// Try to find a running gitea VM
+		giteaConfig := gitea.DefaultConfig()
+		giteaDeployer, err := gitea.NewDeployerFromEnv(giteaConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create gitea deployer: %w", err)
+		}
+		nodes, err := giteaDeployer.List(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list gitea nodes: %w", err)
+		}
+		// Find first gitea VM
+		for _, node := range nodes {
+			if hasTag(node.Tags, "gitea") {
+				giteaHost := node.IP
+				// Strip CIDR suffix
+				if idx := strings.Index(giteaHost, "/"); idx != -1 {
+					giteaHost = giteaHost[:idx]
+				}
+				giteaURL = fmt.Sprintf("http://%s:3000", giteaHost)
+				fmt.Printf("Auto-detected Gitea URL: %s\n", giteaURL)
+				break
+			}
+		}
+		if giteaURL == "" {
+			return fmt.Errorf("no gitea VM found; deploy one with 'mage gitea:deploy' or set GITEA_URL")
+		}
+	}
+	config.GiteaURL = giteaURL
+
+	// Runner token is required
+	runnerToken := os.Getenv("RUNNER_TOKEN")
+	if runnerToken == "" {
+		return fmt.Errorf("RUNNER_TOKEN environment variable is required (get it from %s/admin/actions/runners)", giteaURL)
+	}
+	config.RunnerToken = runnerToken
+
+	// Optional config
+	if name := os.Getenv("RUNNER_NAME"); name != "" {
+		config.Name = name
+		config.RunnerName = name
+	}
+	if labels := os.Getenv("RUNNER_LABELS"); labels != "" {
+		config.Labels = labels
+	}
+	if version := os.Getenv("RUNNER_VERSION"); version != "" {
+		config.Version = version
+	}
+
+	deployer, err := xprunner.NewDeployer(kubeconfig, config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	vm, err := deployer.Deploy(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to deploy runner via crossplane: %w", err)
+	}
+
+	fmt.Printf("Gitea Runner VM created via Crossplane:\n")
+	fmt.Printf("  Name: %s\n", vm.Name)
+	fmt.Printf("  Namespace: %s\n", vm.Namespace)
+	fmt.Printf("\nRunner configured:\n")
+	fmt.Printf("  Gitea URL: %s\n", config.GiteaURL)
+	fmt.Printf("  Labels: %s\n", config.Labels)
+	fmt.Printf("  Version: %s\n", config.Version)
+	fmt.Printf("\nThe VM will be provisioned by Crossplane.\n")
+	fmt.Printf("Check status: mage crossplaneRunner:get %s\n", vm.Name)
+
+	return nil
+}
+
+// List shows all Runner VMs created via Crossplane
+func (CrossplaneRunner) List(ctx context.Context) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	config := xprunner.DefaultConfig()
+
+	deployer, err := xprunner.NewDeployer(kubeconfig, config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	vms, err := deployer.ListAll(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list runner VMs: %w", err)
+	}
+
+	if len(vms) == 0 {
+		fmt.Println("No Crossplane Runner VMs found")
+		return nil
+	}
+
+	fmt.Printf("Crossplane Runner VMs (%d):\n", len(vms))
+	for _, vm := range vms {
+		status := "Pending"
+		for _, cond := range vm.Status.Conditions {
+			if cond.Type == "Ready" {
+				status = cond.Status
+				break
+			}
+		}
+		hostname := vm.Status.AtProvider.Hostname
+		ip := vm.Status.AtProvider.IP
+		if hostname == "" {
+			hostname = "(pending)"
+		}
+		if ip == "" {
+			ip = "(pending)"
+		}
+		fmt.Printf("  - %s [%s] hostname=%s ip=%s tags=%v\n", vm.Name, status, hostname, ip, vm.Spec.ForProvider.Tags)
+	}
+	return nil
+}
+
+// Get shows details of a specific Runner VM
+func (CrossplaneRunner) Get(ctx context.Context, name string) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	config := xprunner.DefaultConfig()
+
+	deployer, err := xprunner.NewDeployer(kubeconfig, config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	vm, err := deployer.Get(ctx, name)
+	if err != nil {
+		return fmt.Errorf("failed to get runner VM %s: %w", name, err)
+	}
+
+	fmt.Printf("Crossplane Runner VM: %s\n", vm.Name)
+	fmt.Printf("  Namespace: %s\n", vm.Namespace)
+	fmt.Printf("\nSpec:\n")
+	fmt.Printf("  HostGroup: %s\n", vm.Spec.ForProvider.HostGroup)
+	fmt.Printf("  CPUs: %d\n", vm.Spec.ForProvider.CPUs)
+	fmt.Printf("  RAM (GB): %d\n", vm.Spec.ForProvider.RAMGB)
+	fmt.Printf("  Tags: %v\n", vm.Spec.ForProvider.Tags)
+	fmt.Printf("\nStatus:\n")
+	fmt.Printf("  Hostname: %s\n", vm.Status.AtProvider.Hostname)
+	fmt.Printf("  IP: %s\n", vm.Status.AtProvider.IP)
+	fmt.Printf("  State: %s\n", vm.Status.AtProvider.State)
+	fmt.Printf("  Created: %s\n", vm.Status.AtProvider.CreatedAt)
+	fmt.Printf("\nConditions:\n")
+	for _, cond := range vm.Status.Conditions {
+		fmt.Printf("  - %s: %s\n", cond.Type, cond.Status)
+	}
+
+	if vm.Status.AtProvider.IP != "" {
+		ip := vm.Status.AtProvider.IP
+		if idx := strings.Index(ip, "/"); idx != -1 {
+			ip = ip[:idx]
+		}
+		fmt.Printf("\nNext steps:\n")
+		fmt.Printf("  SSH: ssh ubuntu@%s\n", ip)
+		fmt.Printf("  Check status: sudo systemctl status act_runner\n")
+		fmt.Printf("  View logs: sudo journalctl -u act_runner -f\n")
+	}
+
+	return nil
+}
+
+// Delete removes a Runner VM created via Crossplane
+func (CrossplaneRunner) Delete(ctx context.Context, name string) error {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	config := xprunner.DefaultConfig()
+
+	deployer, err := xprunner.NewDeployer(kubeconfig, config)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer: %w", err)
+	}
+
+	if err := deployer.Delete(ctx, name); err != nil {
+		return fmt.Errorf("failed to delete runner VM %s: %w", name, err)
+	}
+
+	fmt.Printf("Crossplane Runner VM %s deleted\n", name)
+	return nil
+}
+
+// Userdata prints the Runner userdata script
+func (CrossplaneRunner) Userdata() {
+	fmt.Println(xprunner.Userdata())
 }
 
 

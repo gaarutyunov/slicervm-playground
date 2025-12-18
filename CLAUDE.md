@@ -75,6 +75,22 @@ mage k3s:scaleWorkers <count>     # Scale worker nodes
 mage crossplane:install           # Install Crossplane in K3s cluster
 mage crossplane:uninstall         # Uninstall Crossplane
 
+# Grafana stack targets (Prometheus, Grafana, Alertmanager)
+mage grafana:install              # Install kube-prometheus-stack in K3s cluster
+mage grafana:uninstall            # Uninstall Grafana stack
+mage grafana:status               # Show deployment/pod status
+mage grafana:services             # Show service endpoints and NodePorts
+mage grafana:password             # Get Grafana admin password
+mage grafana:logs [pod-name]      # Show logs from a monitoring pod
+
+# cert-manager targets (TLS certificate automation)
+mage certManager:install          # Install cert-manager in K3s cluster
+mage certManager:uninstall        # Uninstall cert-manager
+mage certManager:status           # Show deployment/pod status
+mage certManager:clusterIssuer    # Create Let's Encrypt ClusterIssuer (requires ACME_EMAIL)
+mage certManager:clusterIssuerList # List all ClusterIssuers
+mage certManager:logs [pod-name]  # Show logs from a cert-manager pod
+
 # Run tests
 go test ./...
 
@@ -115,12 +131,14 @@ client.DeleteVM(ctx, "hostgroup-name", "hostname")
 - `pkg/runner/` - Gitea Actions Runner VM deployment with Docker + act_runner
 - `pkg/k3s/` - K3s Kubernetes cluster deployment (control plane + workers)
 - `pkg/crossplane/` - Crossplane installation using Helm Go SDK
+- `pkg/grafana/` - Grafana stack (kube-prometheus-stack) installation using Helm Go SDK
+- `pkg/certmanager/` - cert-manager installation using Helm Go SDK
 - `magefile.go` - Mage targets that import packages for easier testing
 
 Mage namespaces expose targets for:
 - VM lifecycle (create, delete, list, logs)
 - Preset deployments (BuildKit, OpenFaaS, RustFS, PostgreSQL, Gitea, Runner)
-- Kubernetes cluster management (K3s, Crossplane)
+- Kubernetes cluster management (K3s, Crossplane, Grafana, cert-manager)
 - Auto-detection of dependent VMs (postgres→gitea, rustfs→gitea, gitea→runner)
 
 ### VM Configuration Pattern
@@ -179,6 +197,19 @@ sudo usermod -aG buildkit ubuntu
 - `RUNNER_LABELS` - Runner labels (default: ubuntu-latest, ubuntu-22.04, ubuntu-20.04)
 - `RUNNER_VERSION` - act_runner version (default: 0.2.11)
 
+### Grafana Stack Deployment
+- `GRAFANA_PASSWORD` - Grafana admin password (auto-generated if not set)
+- `GRAFANA_INGRESS_HOST` - Ingress hostname (e.g., grafana.example.com) - enables ingress when set
+- `GRAFANA_INGRESS_CLASS` - Ingress class name (default: traefik)
+- `GRAFANA_TLS` - Enable TLS with cert-manager (set to "true")
+- `GRAFANA_CLUSTER_ISSUER` - ClusterIssuer name (default: letsencrypt-prod) - also enables TLS
+- `PROMETHEUS_RETENTION` - Prometheus data retention in days (default: 10)
+- `PROMETHEUS_STORAGE` - Prometheus storage size (default: 10Gi)
+
+### cert-manager
+- `ACME_EMAIL` - Email for Let's Encrypt notifications (required for ClusterIssuer)
+- `ACME_STAGING` - Use Let's Encrypt staging server (set to "true" for testing)
+
 ## Deployment Workflows
 
 ### Gitea Stack (PostgreSQL + RustFS + Gitea + Runner)
@@ -204,7 +235,7 @@ mage gitea:deploy
 RUNNER_TOKEN=<token-from-gitea-admin> mage runner:deploy
 ```
 
-### K3s + Crossplane
+### K3s + Crossplane + Grafana + cert-manager
 
 ```bash
 # 1. Deploy K3s cluster
@@ -212,6 +243,16 @@ mage k3s:deploy
 
 # 2. Install Crossplane
 mage crossplane:install
+
+# 3. Install cert-manager for TLS certificates
+mage certManager:install
+
+# 4. Install Grafana stack with ingress (Prometheus, Grafana, Alertmanager)
+GRAFANA_INGRESS_HOST=grafana.example.com mage grafana:install
+
+# 5. Get Grafana password and service endpoints
+mage grafana:password
+mage grafana:services
 ```
 
 ## Key SDK Functions

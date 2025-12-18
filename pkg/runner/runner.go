@@ -17,7 +17,7 @@ const (
 	DefaultHostGroup   = "api"
 	DefaultVCPU        = 2
 	DefaultRAMGB       = 4
-	DefaultStorageSize = "25G"
+	DefaultStorageSize = "100G"
 	DefaultVersion     = "0.2.11"
 )
 
